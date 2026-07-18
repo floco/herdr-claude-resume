@@ -970,7 +970,7 @@ def test_wrap_statusline_records_original_and_rewrites_command(tmp_path):
     settings_path = tmp_path / "settings.json"
     _write_settings(settings_path, statusline_command="original-cmd", extra={"otherKey": "kept"})
     originals_file = tmp_path / "originals.json"
-    bridge_script = tmp_path / "bridge.py"
+    bridge_script = tmp_path / "statusline_bridge.py"
 
     changed = wrap_statusline(settings_path, bridge_script, originals_file)
 
@@ -987,7 +987,7 @@ def test_wrap_statusline_is_idempotent(tmp_path):
     settings_path = tmp_path / "settings.json"
     _write_settings(settings_path, statusline_command="original-cmd")
     originals_file = tmp_path / "originals.json"
-    bridge_script = tmp_path / "bridge.py"
+    bridge_script = tmp_path / "statusline_bridge.py"
 
     wrap_statusline(settings_path, bridge_script, originals_file)
     command_after_first_wrap = json.loads(settings_path.read_text())["statusLine"]["command"]
