@@ -669,10 +669,21 @@ import pytest
 from socket_client import HerdrRequestError, HerdrSocket
 
 
-def _serve_once(sock_path, handle_conn):
+def _make_server(sock_path):
+    # bind()+listen() happen synchronously in the test thread, before the
+    # background thread ever starts, so the client can never race ahead of
+    # the server being ready to accept(). Racing this (binding inside the
+    # background thread instead) causes an intermittent FileNotFoundError
+    # on connect(), which aborts the test before thread.join() runs and
+    # leaks a thread parked forever in accept() -- since threads are
+    # non-daemon by default, that hangs the whole test process at exit.
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.bind(sock_path)
     server.listen(1)
+    return server
+
+
+def _accept_and_handle(server, handle_conn):
     conn, _ = server.accept()
     try:
         handle_conn(conn)
@@ -681,8 +692,17 @@ def _serve_once(sock_path, handle_conn):
         server.close()
 
 
+def _start_server_thread(server, handle_conn):
+    # daemon=True is a safety net: even if a test aborts before reaching
+    # thread.join(), a leftover thread can't block process exit.
+    thread = threading.Thread(target=_accept_and_handle, args=(server, handle_conn), daemon=True)
+    thread.start()
+    return thread
+
+
 def test_request_returns_result(tmp_path):
     sock_path = str(tmp_path / "herdr.sock")
+    server = _make_server(sock_path)
 
     def handle(conn):
         data = conn.recv(65536)
@@ -692,8 +712,7 @@ def test_request_returns_result(tmp_path):
         response = json.dumps({"id": request["id"], "result": {"type": "pong"}}) + "\n"
         conn.sendall(response.encode())
 
-    thread = threading.Thread(target=_serve_once, args=(sock_path, handle))
-    thread.start()
+    thread = _start_server_thread(server, handle)
     client = HerdrSocket(sock_path)
     result = client.request("req_1", "ping", {})
     assert result == {"type": "pong"}
@@ -703,6 +722,7 @@ def test_request_returns_result(tmp_path):
 
 def test_request_raises_on_error(tmp_path):
     sock_path = str(tmp_path / "herdr.sock")
+    server = _make_server(sock_path)
 
     def handle(conn):
         data = conn.recv(65536)
@@ -713,8 +733,7 @@ def test_request_raises_on_error(tmp_path):
         )
         conn.sendall(response.encode())
 
-    thread = threading.Thread(target=_serve_once, args=(sock_path, handle))
-    thread.start()
+    thread = _start_server_thread(server, handle)
     client = HerdrSocket(sock_path)
     with pytest.raises(HerdrRequestError) as exc_info:
         client.request("req_1", "pane.get", {"pane_id": "w1:p1"})
@@ -725,6 +744,7 @@ def test_request_raises_on_error(tmp_path):
 
 def test_subscribe_yields_pushed_events(tmp_path):
     sock_path = str(tmp_path / "herdr.sock")
+    server = _make_server(sock_path)
 
     def handle(conn):
         data = conn.recv(65536)
@@ -743,8 +763,7 @@ def test_subscribe_yields_pushed_events(tmp_path):
         )
         conn.sendall(event.encode())
 
-    thread = threading.Thread(target=_serve_once, args=(sock_path, handle))
-    thread.start()
+    thread = _start_server_thread(server, handle)
     client = HerdrSocket(sock_path)
     events = client.subscribe("sub_1", {"subscriptions": [{"type": "pane.output_matched"}]})
     first_event = next(events)
@@ -755,6 +774,7 @@ def test_subscribe_yields_pushed_events(tmp_path):
 
 def test_subscribe_raises_on_error_ack(tmp_path):
     sock_path = str(tmp_path / "herdr.sock")
+    server = _make_server(sock_path)
 
     def handle(conn):
         data = conn.recv(65536)
@@ -765,8 +785,7 @@ def test_subscribe_raises_on_error_ack(tmp_path):
         )
         conn.sendall(response.encode())
 
-    thread = threading.Thread(target=_serve_once, args=(sock_path, handle))
-    thread.start()
+    thread = _start_server_thread(server, handle)
     client = HerdrSocket(sock_path)
     events = client.subscribe("sub_1", {"subscriptions": [{"type": "pane.output_matched"}]})
     with pytest.raises(HerdrRequestError) as exc_info:
