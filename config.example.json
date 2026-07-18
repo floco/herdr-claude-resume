@@ -1,0 +1,6 @@
+{
+  "enabled": true,
+  "resume_message": "continue",
+  "resume_buffer_seconds": 45,
+  "notify": true
+}

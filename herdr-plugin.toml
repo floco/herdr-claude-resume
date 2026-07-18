@@ -1,0 +1,20 @@
+id = "claude-resume"
+name = "Claude Rate-Limit Auto-Resume"
+version = "0.1.0"
+min_herdr_version = "0.7.0"
+description = "Detects Claude Code's 5-hour rate limit and auto-resumes the session when it resets"
+platforms = ["linux", "macos"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["python3", "scripts/on_agent_detected.py"]
+
+[[events]]
+on = "pane.closed"
+command = ["python3", "scripts/on_pane_closed.py"]
+
+[[actions]]
+id = "status"
+title = "List watched Claude panes"
+contexts = ["workspace"]
+command = ["python3", "scripts/status.py"]
