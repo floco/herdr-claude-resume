@@ -27,7 +27,9 @@ def parse_event(event_json: str) -> dict:
 
 
 def should_watch(event: dict) -> bool:
-    return event.get("agent") == "claude"
+    # HERDR_PLUGIN_EVENT_JSON is the full EventEnvelope: {"event": "...",
+    # "data": {...}}, not a flat dict -- the agent field lives under "data".
+    return (event.get("data") or {}).get("agent") == "claude"
 
 
 def maybe_spawn_watcher(
@@ -64,10 +66,7 @@ def main() -> int:
     socket_path = os.environ["HERDR_SOCKET_PATH"]
 
     sock = HerdrSocket(socket_path)
-    try:
-        pane = sock.request("claude-resume:on-detect:pane-get", "pane.get", {"pane_id": pane_id})
-    finally:
-        sock.close()
+    pane = sock.request("claude-resume:on-detect:pane-get", "pane.get", {"pane_id": pane_id})
     cwd = pane.get("cwd") or os.getcwd()
 
     maybe_spawn_watcher(pane_id, cwd, state_dir)

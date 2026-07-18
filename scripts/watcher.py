@@ -193,10 +193,10 @@ def main(argv: list[str]) -> int:
 
     ensure_statusline_bridge(cwd, state_dir)
 
+    sock = HerdrSocket(socket_path)
     try:
         cycle_index = 0
         while True:
-            sock = HerdrSocket(socket_path)
             try:
                 pane = sock.request(
                     f"claude-resume:{pane_id}:{cycle_index}:pane-get", "pane.get", {"pane_id": pane_id}
@@ -205,8 +205,6 @@ def main(argv: list[str]) -> int:
                 run_cycle(sock, pane_id, cwd, state_dir, config, session_id, cycle_index)
             except HerdrRequestError:
                 return 0
-            finally:
-                sock.close()
             cycle_index += 1
     finally:
         remove_watcher_pidfile(state_dir, pane_id)

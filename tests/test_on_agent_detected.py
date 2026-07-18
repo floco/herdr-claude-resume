@@ -6,9 +6,9 @@ from state import is_watcher_running, write_watcher_pidfile
 
 
 def test_parse_event_valid_json():
-    assert parse_event('{"agent": "claude", "pane_id": "w1:p1"}') == {
-        "agent": "claude",
-        "pane_id": "w1:p1",
+    assert parse_event('{"event": "pane.agent_detected", "data": {"agent": "claude"}}') == {
+        "event": "pane.agent_detected",
+        "data": {"agent": "claude"},
     }
 
 
@@ -17,15 +17,23 @@ def test_parse_event_invalid_json_returns_empty_dict():
 
 
 def test_should_watch_true_for_claude():
-    assert should_watch({"agent": "claude"}) is True
+    # HERDR_PLUGIN_EVENT_JSON is the full EventEnvelope shape herdr actually
+    # sends: {"event": ..., "data": {...}} -- the agent field is nested
+    # under "data", not top-level. A flat {"agent": "claude"} fixture here
+    # previously hid a real bug where should_watch checked the wrong key.
+    assert should_watch({"event": "pane.agent_detected", "data": {"agent": "claude", "pane_id": "w1:p1"}}) is True
 
 
 def test_should_watch_false_for_other_agent():
-    assert should_watch({"agent": "codex"}) is False
+    assert should_watch({"event": "pane.agent_detected", "data": {"agent": "codex"}}) is False
 
 
 def test_should_watch_false_for_missing_agent():
-    assert should_watch({}) is False
+    assert should_watch({"event": "pane.agent_detected", "data": {}}) is False
+
+
+def test_should_watch_false_for_missing_data():
+    assert should_watch({"event": "pane.agent_detected"}) is False
 
 
 def test_maybe_spawn_watcher_spawns_when_not_running(tmp_path):
