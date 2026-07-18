@@ -653,7 +653,7 @@ git commit -m "Add watcher pidfile helpers"
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `socket_client.HerdrSocket(socket_path, timeout=5.0)` with methods `.request(request_id, method, params) -> dict` (raises `HerdrRequestError` on an `{"error": ...}` response) and `.subscribe(request_id, params) -> Iterator[dict]` (yields each pushed event dict after the initial ack; raises `HerdrRequestError` if the ack itself is an error), and `.close()`. Also produces `socket_client.HerdrRequestError(code: str, message: str)` with `.code`/`.message` attributes. Used by `watcher.py` (Task 7) and `on_agent_detected.py` (Task 8).
+- Produces: `socket_client.HerdrSocket(socket_path, timeout=5.0)` with methods `.request(request_id, method, params) -> dict` (opens its own connection, raises `HerdrRequestError` on an `{"error": ...}` response) and `.subscribe(request_id, params) -> Iterator[dict]` (opens and holds its own connection for the life of the iterator, yields each pushed event dict after the initial ack, drops its timeout after the ack since a subscription may wait far longer than a regular request; raises `HerdrRequestError` if the ack itself is an error). There is no `.close()` — each call manages its own connection lifecycle, since herdr's server allows only one request per connection. Also produces `socket_client.HerdrRequestError(code: str, message: str)` with `.code`/`.message` attributes. Used by `watcher.py` (Task 7) and `on_agent_detected.py` (Task 8).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -716,7 +716,6 @@ def test_request_returns_result(tmp_path):
     client = HerdrSocket(sock_path)
     result = client.request("req_1", "ping", {})
     assert result == {"type": "pong"}
-    client.close()
     thread.join(timeout=2)
 
 
@@ -738,7 +737,6 @@ def test_request_raises_on_error(tmp_path):
     with pytest.raises(HerdrRequestError) as exc_info:
         client.request("req_1", "pane.get", {"pane_id": "w1:p1"})
     assert exc_info.value.code == "not_found"
-    client.close()
     thread.join(timeout=2)
 
 
@@ -768,7 +766,35 @@ def test_subscribe_yields_pushed_events(tmp_path):
     events = client.subscribe("sub_1", {"subscriptions": [{"type": "pane.output_matched"}]})
     first_event = next(events)
     assert first_event["data"]["matched_line"] == "5-hour limit reached - resets 3pm"
-    client.close()
+    thread.join(timeout=2)
+
+
+def test_subscribe_does_not_time_out_waiting_for_a_delayed_event(tmp_path):
+    # Regression test: a rate-limit subscription may legitimately need to
+    # wait far longer than the regular request timeout for the next
+    # matching output line. Only the connect + initial-ack read should use
+    # the short timeout; waiting for the pushed event itself must block
+    # rather than raise TimeoutError. Uses a short client timeout (0.2s) and
+    # a server delay longer than it (0.5s) so a regression fails fast.
+    import time
+
+    sock_path = str(tmp_path / "herdr.sock")
+    server = _make_server(sock_path)
+
+    def handle(conn):
+        data = conn.recv(65536)
+        request = json.loads(data.decode().strip())
+        ack = json.dumps({"id": request["id"], "result": {"type": "subscribed"}}) + "\n"
+        conn.sendall(ack.encode())
+        time.sleep(0.5)
+        event = json.dumps({"event": "pane.output_matched", "data": {"matched_line": "delayed"}}) + "\n"
+        conn.sendall(event.encode())
+
+    thread = _start_server_thread(server, handle)
+    client = HerdrSocket(sock_path, timeout=0.2)
+    events = client.subscribe("sub_1", {"subscriptions": [{"type": "pane.output_matched"}]})
+    first_event = next(events)
+    assert first_event["data"]["matched_line"] == "delayed"
     thread.join(timeout=2)
 
 
@@ -791,7 +817,6 @@ def test_subscribe_raises_on_error_ack(tmp_path):
     with pytest.raises(HerdrRequestError) as exc_info:
         next(events)
     assert exc_info.value.code == "invalid_regex"
-    client.close()
     thread.join(timeout=2)
 ```
 
@@ -808,6 +833,15 @@ Create `scripts/lib/socket_client.py`:
 """Minimal raw client for herdr's local socket API (newline-delimited JSON
 over a Unix domain socket). No dependency beyond the standard library --
 mirrors the approach herdr's own bundled Claude integration script uses.
+
+herdr's socket server handles exactly one request per accepted connection
+(it reads one line, dispatches, writes one response, and closes) except for
+`events.subscribe`, which keeps its connection open to push further event
+lines. Each call below opens its own fresh connection accordingly -- reusing
+one connection across multiple `.request()` calls raises BrokenPipeError,
+since the server has already closed its end after the first response. This
+was confirmed against herdr's own source (`src/api/server.rs::handle_connection`)
+after a live test against a real herdr server hit exactly that error.
 """
 from __future__ import annotations
 
@@ -825,49 +859,71 @@ class HerdrRequestError(RuntimeError):
 
 class HerdrSocket:
     def __init__(self, socket_path: str, timeout: float = 5.0):
-        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self._sock.settimeout(timeout)
-        self._sock.connect(socket_path)
-        self._buffer = b""
+        self.socket_path = socket_path
+        self.timeout = timeout
 
-    def _read_line(self) -> dict:
-        while b"\n" not in self._buffer:
-            chunk = self._sock.recv(65536)
+    def _connect(self) -> socket.socket:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        sock.connect(self.socket_path)
+        return sock
+
+    @staticmethod
+    def _read_line(sock: socket.socket, buffer: bytes) -> tuple[dict, bytes]:
+        while b"\n" not in buffer:
+            chunk = sock.recv(65536)
             if not chunk:
                 raise ConnectionError("herdr socket closed")
-            self._buffer += chunk
-        line, _, self._buffer = self._buffer.partition(b"\n")
-        return json.loads(line.decode("utf-8"))
+            buffer += chunk
+        line, _, rest = buffer.partition(b"\n")
+        return json.loads(line.decode("utf-8")), rest
 
     def request(self, request_id: str, method: str, params: dict) -> dict:
-        payload = json.dumps({"id": request_id, "method": method, "params": params})
-        self._sock.sendall((payload + "\n").encode("utf-8"))
-        response = self._read_line()
-        if "error" in response:
-            error = response["error"]
-            raise HerdrRequestError(error.get("code", "unknown"), error.get("message", ""))
-        return response["result"]
+        sock = self._connect()
+        try:
+            payload = json.dumps({"id": request_id, "method": method, "params": params})
+            sock.sendall((payload + "\n").encode("utf-8"))
+            response, _ = self._read_line(sock, b"")
+            if "error" in response:
+                error = response["error"]
+                raise HerdrRequestError(error.get("code", "unknown"), error.get("message", ""))
+            return response["result"]
+        finally:
+            sock.close()
 
     def subscribe(self, request_id: str, params: dict) -> Iterator[dict]:
         """Send an events.subscribe request and yield each pushed event
-        after the initial ack. This call blocks between yields."""
-        payload = json.dumps({"id": request_id, "method": "events.subscribe", "params": params})
-        self._sock.sendall((payload + "\n").encode("utf-8"))
-        ack = self._read_line()
-        if "error" in ack:
-            error = ack["error"]
-            raise HerdrRequestError(error.get("code", "unknown"), error.get("message", ""))
-        while True:
-            yield self._read_line()
+        after the initial ack. This holds one connection open for as long
+        as the caller keeps consuming the iterator.
 
-    def close(self) -> None:
-        self._sock.close()
+        The connect and initial-ack read use the regular short timeout, so
+        an unreachable server fails fast. After that, the socket switches to
+        blocking mode (no timeout): a rate-limit subscription may
+        legitimately need to wait hours for the next matching output line,
+        and a fixed short timeout would wrongly raise TimeoutError while
+        correctly waiting for that.
+        """
+        sock = self._connect()
+        try:
+            payload = json.dumps({"id": request_id, "method": "events.subscribe", "params": params})
+            sock.sendall((payload + "\n").encode("utf-8"))
+            buffer = b""
+            ack, buffer = self._read_line(sock, buffer)
+            if "error" in ack:
+                error = ack["error"]
+                raise HerdrRequestError(error.get("code", "unknown"), error.get("message", ""))
+            sock.settimeout(None)
+            while True:
+                event, buffer = self._read_line(sock, buffer)
+                yield event
+        finally:
+            sock.close()
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `python3 -m pytest tests/test_socket_client.py -v`
-Expected: 4 passed
+Expected: 5 passed
 
 - [ ] **Step 5: Commit**
 
@@ -1691,10 +1747,10 @@ def main(argv: list[str]) -> int:
 
     ensure_statusline_bridge(cwd, state_dir)
 
+    sock = HerdrSocket(socket_path)
     try:
         cycle_index = 0
         while True:
-            sock = HerdrSocket(socket_path)
             try:
                 pane = sock.request(
                     f"claude-resume:{pane_id}:{cycle_index}:pane-get", "pane.get", {"pane_id": pane_id}
@@ -1703,8 +1759,6 @@ def main(argv: list[str]) -> int:
                 run_cycle(sock, pane_id, cwd, state_dir, config, session_id, cycle_index)
             except HerdrRequestError:
                 return 0
-            finally:
-                sock.close()
             cycle_index += 1
     finally:
         remove_watcher_pidfile(state_dir, pane_id)
@@ -1752,9 +1806,9 @@ from state import is_watcher_running, write_watcher_pidfile
 
 
 def test_parse_event_valid_json():
-    assert parse_event('{"agent": "claude", "pane_id": "w1:p1"}') == {
-        "agent": "claude",
-        "pane_id": "w1:p1",
+    assert parse_event('{"event": "pane.agent_detected", "data": {"agent": "claude"}}') == {
+        "event": "pane.agent_detected",
+        "data": {"agent": "claude"},
     }
 
 
@@ -1763,15 +1817,23 @@ def test_parse_event_invalid_json_returns_empty_dict():
 
 
 def test_should_watch_true_for_claude():
-    assert should_watch({"agent": "claude"}) is True
+    # HERDR_PLUGIN_EVENT_JSON is the full EventEnvelope shape herdr actually
+    # sends: {"event": ..., "data": {...}} -- the agent field is nested
+    # under "data", not top-level. A flat {"agent": "claude"} fixture here
+    # previously hid a real bug where should_watch checked the wrong key.
+    assert should_watch({"event": "pane.agent_detected", "data": {"agent": "claude", "pane_id": "w1:p1"}}) is True
 
 
 def test_should_watch_false_for_other_agent():
-    assert should_watch({"agent": "codex"}) is False
+    assert should_watch({"event": "pane.agent_detected", "data": {"agent": "codex"}}) is False
 
 
 def test_should_watch_false_for_missing_agent():
-    assert should_watch({}) is False
+    assert should_watch({"event": "pane.agent_detected", "data": {}}) is False
+
+
+def test_should_watch_false_for_missing_data():
+    assert should_watch({"event": "pane.agent_detected"}) is False
 
 
 def test_maybe_spawn_watcher_spawns_when_not_running(tmp_path):
@@ -1871,7 +1933,12 @@ def parse_event(event_json: str) -> dict:
 
 
 def should_watch(event: dict) -> bool:
-    return event.get("agent") == "claude"
+    # HERDR_PLUGIN_EVENT_JSON is the full EventEnvelope: {"event": "...",
+    # "data": {...}}, not a flat dict -- the agent field lives under "data".
+    # A live test against a real herdr server caught this: a flat-dict
+    # fixture in the unit test hid that should_watch was reading the wrong
+    # key, so the hook silently never spawned a watcher.
+    return (event.get("data") or {}).get("agent") == "claude"
 
 
 def maybe_spawn_watcher(
@@ -1908,10 +1975,7 @@ def main() -> int:
     socket_path = os.environ["HERDR_SOCKET_PATH"]
 
     sock = HerdrSocket(socket_path)
-    try:
-        pane = sock.request("claude-resume:on-detect:pane-get", "pane.get", {"pane_id": pane_id})
-    finally:
-        sock.close()
+    pane = sock.request("claude-resume:on-detect:pane-get", "pane.get", {"pane_id": pane_id})
     cwd = pane.get("cwd") or os.getcwd()
 
     maybe_spawn_watcher(pane_id, cwd, state_dir)
@@ -1925,7 +1989,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the new tests to verify they pass**
 
 Run: `python3 -m pytest tests/test_on_agent_detected.py -v`
-Expected: 8 passed, well under a second (the last test blocks on `os.waitpid`
+Expected: 9 passed, well under a second (the last test blocks on `os.waitpid`
 rather than a fixed sleep, so it finishes as soon as the 0.5s stub child
 actually exits)
 
@@ -2222,6 +2286,18 @@ Automated tests cover the parsing, state, socket-protocol, and
 statusLine-wrapping logic without needing a real herdr server or a real
 Claude Code rate-limit hit. After linking the plugin, verify the following
 by hand against a real herdr + Claude Code session:
+
+**Use an isolated test session and HOME, not your real one.** Link and
+exercise the plugin against a dedicated named session
+(`herdr --session <test-name> server`, then `herdr --session <test-name>
+plugin link .`), not the session you use for real work. If you manually
+invoke `watcher.py` outside of herdr's own spawn path (e.g. to reproduce a
+bug), override `HOME` to a scratch directory too: `ensure_statusline_bridge`
+falls back to the real `~/.claude/settings.json` by design when a project
+has no statusLine of its own, and a first pass at this verification wrapped
+the real settings file on the test machine before this warning existed.
+That's correct behavior for a real user's real session — it's only a
+problem when the "session" under test is actually the machine's live one.
 
 1. Link the plugin (`herdr plugin link .`), open a Claude Code pane, and
    confirm a watcher started: check for a pidfile under
