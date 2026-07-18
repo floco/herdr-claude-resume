@@ -17,7 +17,23 @@ limit and automatically resumes the session once the window resets.
 
 ## Install
 
-Local development:
+From GitHub:
+
+```bash
+herdr plugin install floco/herdr-claude-resume
+herdr plugin config-dir claude-resume
+```
+
+`plugin install` shows a preview of the manifest and commands before
+confirming; pass `--yes` to skip that prompt for sources you already trust,
+and `--ref <branch-or-tag>` to pin a specific revision. There is no separate
+`plugin update` — reinstall to pull the latest commit:
+
+```bash
+herdr plugin install floco/herdr-claude-resume --yes
+```
+
+Local development (working on the plugin itself):
 
 ```bash
 herdr plugin link .
