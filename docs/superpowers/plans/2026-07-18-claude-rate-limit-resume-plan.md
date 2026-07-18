@@ -1744,13 +1744,11 @@ git commit -m "Add per-pane rate-limit watcher daemon"
 Create `tests/test_on_agent_detected.py`:
 
 ```python
-import subprocess
-import sys
-import time
+import os
 from pathlib import Path
 
 from on_agent_detected import maybe_spawn_watcher, parse_event, should_watch
-from state import is_watcher_running
+from state import is_watcher_running, write_watcher_pidfile
 
 
 def test_parse_event_valid_json():
@@ -1780,13 +1778,19 @@ def test_maybe_spawn_watcher_spawns_when_not_running(tmp_path):
     calls = []
 
     class FakeProcess:
-        pid = 4321
+        # Use the test process's own real, alive pid -- is_watcher_running
+        # does a real os.kill(pid, 0) liveness check, so an arbitrary made-up
+        # pid number would make this assertion flaky/false depending on
+        # whatever happens to hold that pid on the test machine.
+        pid = os.getpid()
 
     def fake_popen(argv, **kwargs):
         calls.append(argv)
         return FakeProcess()
 
-    spawned = maybe_spawn_watcher("w1:p1", "/repo", tmp_path, watcher_script=Path("/fake/watcher.py"), popen_fn=fake_popen)
+    spawned = maybe_spawn_watcher(
+        "w1:p1", "/repo", tmp_path, watcher_script=Path("/fake/watcher.py"), popen_fn=fake_popen
+    )
 
     assert spawned is True
     assert len(calls) == 1
@@ -1795,9 +1799,6 @@ def test_maybe_spawn_watcher_spawns_when_not_running(tmp_path):
 
 
 def test_maybe_spawn_watcher_skips_when_already_running(tmp_path):
-    from state import write_watcher_pidfile
-    import os
-
     write_watcher_pidfile(tmp_path, "w1:p1", os.getpid())
 
     def fail_popen(argv, **kwargs):
@@ -1812,13 +1813,22 @@ def test_maybe_spawn_watcher_skips_when_already_running(tmp_path):
 
 def test_maybe_spawn_watcher_real_detached_process(tmp_path):
     stub_script = tmp_path / "stub_watcher.py"
-    stub_script.write_text("import time\ntime.sleep(2)\n")
+    stub_script.write_text("import time\ntime.sleep(0.5)\n")
 
     spawned = maybe_spawn_watcher("w1:p1", "/repo", tmp_path, watcher_script=stub_script)
 
     assert spawned is True
     assert is_watcher_running(tmp_path, "w1:p1") is True
-    time.sleep(3)
+
+    pidfile = tmp_path / "watchers" / "w1_p1.pid"
+    pid = int(pidfile.read_text().splitlines()[0])
+    # Reap the child explicitly: the test process is its parent (Popen was
+    # not double-forked), so an unreaped exited child becomes a zombie that
+    # os.kill(pid, 0) still reports as "alive" -- waitpid blocks until it
+    # actually exits and then reaps it, which is what makes the following
+    # assertion deterministic instead of a timing guess.
+    os.waitpid(pid, 0)
+
     assert is_watcher_running(tmp_path, "w1:p1") is False
 ```
 
@@ -1915,7 +1925,9 @@ if __name__ == "__main__":
 - [ ] **Step 4: Run the new tests to verify they pass**
 
 Run: `python3 -m pytest tests/test_on_agent_detected.py -v`
-Expected: 8 passed (the last test sleeps ~3s, so this file takes a few seconds)
+Expected: 8 passed, well under a second (the last test blocks on `os.waitpid`
+rather than a fixed sleep, so it finishes as soon as the 0.5s stub child
+actually exits)
 
 - [ ] **Step 5: Add the manifest script-existence check now that the file exists**
 
