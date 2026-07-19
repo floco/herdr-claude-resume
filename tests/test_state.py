@@ -3,6 +3,7 @@ import subprocess
 import sys
 
 from state import (
+    default_plugin_state_dir,
     is_watcher_running,
     kill_watcher,
     list_watched_pane_ids,
@@ -10,6 +11,17 @@ from state import (
     watcher_pidfile_path,
     write_watcher_pidfile,
 )
+
+
+def test_default_plugin_state_dir_uses_xdg_state_home_when_set(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path))
+    assert default_plugin_state_dir() == tmp_path / "herdr" / "plugins" / "claude-resume"
+
+
+def test_default_plugin_state_dir_falls_back_to_home_local_state(tmp_path, monkeypatch):
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert default_plugin_state_dir() == tmp_path / ".local" / "state" / "herdr" / "plugins" / "claude-resume"
 
 
 def test_pidfile_path_sanitizes_pane_id(tmp_path):

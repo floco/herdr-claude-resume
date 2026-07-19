@@ -16,6 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "lib"))
 
+from state import default_plugin_state_dir  # noqa: E402
 from statusline_settings import atomic_write  # noqa: E402
 
 
@@ -55,7 +56,14 @@ def main(argv: list[str]) -> int:
 
     stdin_bytes = sys.stdin.buffer.read()
 
-    state_dir = Path(os.environ.get("HERDR_PLUGIN_STATE_DIR", "."))
+    # Claude Code invokes this script directly as its statusLine command --
+    # that path never goes through herdr's plugin runtime, so
+    # HERDR_PLUGIN_STATE_DIR is not set there. Falling back to "." (cwd)
+    # would silently write into whatever project Claude Code happened to
+    # be running in and break the originals.json lookup below; fall back
+    # to the same fixed location herdr itself uses for this plugin instead.
+    env_state_dir = os.environ.get("HERDR_PLUGIN_STATE_DIR")
+    state_dir = Path(env_state_dir) if env_state_dir else default_plugin_state_dir()
     try:
         payload = json.loads(stdin_bytes.decode("utf-8"))
     except json.JSONDecodeError:

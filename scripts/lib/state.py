@@ -7,6 +7,28 @@ import os
 import signal
 from pathlib import Path
 
+PLUGIN_ID = "claude-resume"
+
+
+def default_plugin_state_dir() -> Path:
+    """Mirrors herdr's own XDG state-dir resolution for this plugin
+    (`$XDG_STATE_HOME/herdr/plugins/claude-resume`, falling back to
+    `~/.local/state/herdr/plugins/claude-resume`).
+
+    herdr only sets HERDR_PLUGIN_STATE_DIR when it directly launches a
+    plugin's own action/event commands. Claude Code invokes
+    statusline_bridge.py itself as its configured statusLine command --
+    that path never goes through herdr's plugin runtime, so the env var is
+    never set there. Falling back to "." (the process's cwd) in that case
+    silently wrote cache files into whatever project Claude Code happened
+    to be running in, and also broke the bridge's lookup of the original
+    statusLine command. This function is the correct, location-independent
+    fallback for that path.
+    """
+    xdg_state_home = os.environ.get("XDG_STATE_HOME")
+    base = Path(xdg_state_home) if xdg_state_home else Path.home() / ".local" / "state"
+    return base / "herdr" / "plugins" / PLUGIN_ID
+
 
 def watcher_pidfile_path(state_dir: Path, pane_id: str) -> Path:
     safe_pane_id = pane_id.replace("/", "_").replace(":", "_")

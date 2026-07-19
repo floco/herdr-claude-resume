@@ -74,3 +74,47 @@ def test_main_passthrough_and_snapshot_end_to_end(tmp_path):
     snapshot = json.loads((state_dir / "statusline" / "sess-1.json").read_text())
     assert snapshot["session_id"] == "sess-1"
     assert snapshot["resets_at"] == 1780000000
+
+
+def test_main_falls_back_to_default_state_dir_when_env_var_unset(tmp_path):
+    # Regression test: Claude Code invokes this script directly as its
+    # configured statusLine command, which never goes through herdr's
+    # plugin runtime -- HERDR_PLUGIN_STATE_DIR is genuinely absent there,
+    # not just unset in a test fixture. The old "." fallback silently wrote
+    # into the subprocess's cwd (a real project directory in practice) and
+    # could never find originals.json, so the wrapped statusLine broke
+    # silently. Runs with a fake HOME and a cwd that is NOT the state dir,
+    # asserting the snapshot lands under HOME's default state path and the
+    # passthrough to the original command still works.
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    project_cwd = tmp_path / "project"
+    project_cwd.mkdir()
+
+    default_state_dir = fake_home / ".local" / "state" / "herdr" / "plugins" / "claude-resume"
+    originals_file = default_state_dir / "statusline" / "originals.json"
+    originals_file.parent.mkdir(parents=True)
+    settings_path = tmp_path / "settings.json"
+    originals_file.write_text(json.dumps({str(settings_path): "cat"}))
+
+    stdin_payload = json.dumps(
+        {
+            "session_id": "sess-2",
+            "rate_limits": {"five_hour": {"used_percentage": 95.0, "resets_at": 1784410800}},
+        }
+    )
+
+    result = subprocess.run(
+        [sys.executable, str(BRIDGE_SCRIPT), "--settings", str(settings_path)],
+        input=stdin_payload,
+        capture_output=True,
+        text=True,
+        cwd=project_cwd,
+        env={"HOME": str(fake_home), "PATH": "/usr/bin:/bin"},
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == stdin_payload
+    snapshot = json.loads((default_state_dir / "statusline" / "sess-2.json").read_text())
+    assert snapshot["session_id"] == "sess-2"
+    assert not (project_cwd / "statusline").exists()
